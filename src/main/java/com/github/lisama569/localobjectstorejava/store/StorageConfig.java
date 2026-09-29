@@ -20,8 +20,11 @@ public class StorageConfig {
     /** 最大分片数量 */
     private int maxParts = 10_000;
 
-    /** 未完成上传会话的过期毫秒数 */
+    /** 未完成上传会话的滑动空闲过期阈值（毫秒）：连续空闲超过该值即过期 */
     private long uploadTtlMillis = 24L * 3600 * 1000;
+
+    /** 后台过期扫描间隔（毫秒）；<=0 表示关闭后台扫描，改为访问时惰性过期 */
+    private long expirySweepIntervalMillis = 60_000L;
 
     public String getRootDir() { return rootDir; }
     public void setRootDir(String rootDir) { this.rootDir = rootDir; }
@@ -33,4 +36,6 @@ public class StorageConfig {
     public void setMaxParts(int maxParts) { this.maxParts = maxParts; }
     public long getUploadTtlMillis() { return uploadTtlMillis; }
     public void setUploadTtlMillis(long uploadTtlMillis) { this.uploadTtlMillis = uploadTtlMillis; }
+    public long getExpirySweepIntervalMillis() { return expirySweepIntervalMillis; }
+    public void setExpirySweepIntervalMillis(long v) { this.expirySweepIntervalMillis = v; }
 }

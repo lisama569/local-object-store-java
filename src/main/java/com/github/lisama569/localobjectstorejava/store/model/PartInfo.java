@@ -8,4 +8,6 @@ public record PartInfo(
         /** 分片内容的 SHA-256（hex），同时作为内容寻址键 */
         String sha256,
         long size) implements Serializable {
+    @SuppressWarnings("unused")
+    private static final long serialVersionUID = 1L;
 }

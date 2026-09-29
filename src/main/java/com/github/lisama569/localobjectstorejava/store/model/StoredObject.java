@@ -7,6 +7,8 @@ import java.util.List;
 /** 一个对象的元数据：归属者与版本历史（新版本在列表尾部）。 */
 public class StoredObject implements Serializable {
 
+    private static final long serialVersionUID = 1L;
+
     private final String key;
     private final String owner;
     private final List<ObjectVersion> versions = new ArrayList<>();

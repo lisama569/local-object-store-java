@@ -24,6 +24,31 @@ final class TestSupport {
         return newService(dir, 64L * 1024 * 1024, 8L * 1024 * 1024);
     }
 
+    /** 自定义滑动空闲过期阈值（毫秒），其余沿用默认。 */
+    static ObjectStoreService newServiceWithTtl(Path dir, long ttlMillis) {
+        StorageConfig config = new StorageConfig();
+        config.setRootDir(dir.toString());
+        config.setExpirySweepIntervalMillis(0L); // 单测里手动控制过期，禁用后台扫描
+        config.setUploadTtlMillis(ttlMillis);
+        return new ObjectStoreService(config, new ContentStore(config), new MetadataStore(config));
+    }
+
+    /** 自定义滑动空闲过期阈值，并返回持有底层组件的测试夹具。 */
+    static Fixture fixtureWithTtl(Path dir, long ttlMillis) {
+        StorageConfig config = new StorageConfig();
+        config.setRootDir(dir.toString());
+        config.setExpirySweepIntervalMillis(0L);
+        config.setUploadTtlMillis(ttlMillis);
+        ContentStore contentStore = new ContentStore(config);
+        MetadataStore metadataStore = new MetadataStore(config);
+        return new Fixture(new ObjectStoreService(config, contentStore, metadataStore),
+                contentStore, metadataStore, config);
+    }
+
+    record Fixture(ObjectStoreService service, ContentStore contentStore,
+                   MetadataStore metadataStore, StorageConfig config) {
+    }
+
     static byte[] bytes(String seed, int size) {
         byte[] data = new byte[size];
         byte[] s = seed.getBytes();

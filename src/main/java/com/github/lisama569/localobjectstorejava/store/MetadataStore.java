@@ -9,6 +9,7 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.Serial;
 import java.io.Serializable;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -35,6 +36,8 @@ public class MetadataStore {
     /** 持久化快照：对象元数据 + 上传会话。 */
     record Snapshot(Map<String, StoredObject> objects,
                     Map<String, MultipartUpload> uploads) implements Serializable {
+        @Serial
+        private static final long serialVersionUID = 1L;
     }
 
     private final Path snapshotFile;
@@ -99,6 +102,11 @@ public class MetadataStore {
             }
         }
         return result;
+    }
+
+    /** 列出全部上传会话（后台过期扫描使用）。 */
+    public List<MultipartUpload> allUploads() {
+        return new ArrayList<>(uploads.values());
     }
 
     public void saveUpload(MultipartUpload upload) {

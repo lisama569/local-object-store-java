@@ -19,8 +19,14 @@ public class StoreException extends RuntimeException {
         PART_SIZE_EXCEEDED,
         /** 元数据冲突（并发修改、重复提交冲突等） */
         CONFLICT,
-        /** 状态非法（如上传已完成/已中止/已过期） */
+        /** 状态非法（如上传已完成/已中止） */
         INVALID_STATE,
+        /** 声明了分片总数但完成时仍有缺口（区别于校验失败、状态非法） */
+        MISSING_PARTS,
+        /** 上传会话连续空闲超时，已被回收且不能续传/完成（区别于 INVALID_STATE） */
+        UPLOAD_EXPIRED,
+        /** 字节区间越界（start/end 超出对象实际长度），区别于 BAD_REQUEST 的非法格式 */
+        RANGE_NOT_SATISFIABLE,
         /** 底层存储失败 */
         STORAGE_FAILURE,
         /** 请求参数非法 */

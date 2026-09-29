@@ -7,7 +7,9 @@ import com.github.lisama569.localobjectstorejava.store.model.ObjectVersion;
 import com.github.lisama569.localobjectstorejava.store.model.PartInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -40,8 +42,9 @@ public class ObjectStoreController {
         this.service = service;
     }
 
-    public record CreateUploadRequest(String key) {}
-    public record CreateUploadResponse(String uploadId, String key, long expiresAtMillis) {}
+    public record CreateUploadRequest(String key, Integer expectedTotalParts) {}
+    public record CreateUploadResponse(String uploadId, String key, long expiresAtMillis,
+                                       Integer expectedTotalParts) {}
     public record PartResponse(int partNumber, String sha256, long size) {}
     public record VersionResponse(String versionId, String contentHash, long size,
                                   long createdAtMillis, boolean deleteMarker) {}
@@ -50,21 +53,27 @@ public class ObjectStoreController {
     @PostMapping("/uploads")
     public CreateUploadResponse createUpload(@RequestHeader("X-Owner") String owner,
                                              @RequestBody CreateUploadRequest req) {
-        MultipartUpload u = service.createUpload(owner, req.key());
-        return new CreateUploadResponse(u.uploadId(), u.key(), u.expiresAtMillis());
+        if (req == null || req.key() == null) {
+            throw new StoreException(StoreException.Code.BAD_REQUEST, "key 不能为空");
+        }
+        MultipartUpload u = service.createUpload(owner, req.key(), req.expectedTotalParts());
+        return new CreateUploadResponse(u.uploadId(), u.key(), u.expiresAtMillis(),
+                u.expectedTotalParts());
     }
 
     @GetMapping("/uploads/{uploadId}")
     public Map<String, Object> getUpload(@RequestHeader("X-Owner") String owner,
                                          @PathVariable String uploadId) {
         MultipartUpload u = service.getUpload(owner, uploadId);
-        return Map.of(
-                "uploadId", u.uploadId(),
-                "key", u.key(),
-                "state", u.state().name(),
-                "expiresAtMillis", u.expiresAtMillis(),
-                "parts", u.parts().values().stream()
-                        .map(p -> new PartResponse(p.partNumber(), p.sha256(), p.size())).toList());
+        Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("uploadId", u.uploadId());
+        body.put("key", u.key());
+        body.put("state", u.state().name());
+        body.put("expiresAtMillis", u.expiresAtMillis());
+        body.put("expectedTotalParts", u.expectedTotalParts());
+        body.put("parts", u.parts().values().stream()
+                .map(p -> new PartResponse(p.partNumber(), p.sha256(), p.size())).toList());
+        return body;
     }
 
     @PutMapping("/uploads/{uploadId}/parts/{partNumber}")
@@ -100,12 +109,31 @@ public class ObjectStoreController {
     }
 
     @GetMapping("/objects/{key}")
-    public byte[] getObject(@RequestHeader("X-Owner") String owner,
-                            @PathVariable String key,
-                            @RequestParam(required = false) String versionId) {
-        return versionId == null
-                ? service.getObject(owner, key)
-                : service.getObjectVersion(owner, key, versionId);
+    public ResponseEntity<byte[]> getObject(@RequestHeader("X-Owner") String owner,
+                                            @PathVariable String key,
+                                            @RequestParam(required = false) String versionId,
+                                            @RequestParam(required = false) Long start,
+                                            @RequestParam(required = false) Long end) {
+        boolean ranged = start != null || end != null;
+        if (!ranged) {
+            byte[] data = versionId == null
+                    ? service.getObject(owner, key)
+                    : service.getObjectVersion(owner, key, versionId);
+            return ResponseEntity.ok()
+                    .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                    .body(data);
+        }
+        ObjectStoreService.Range r = versionId == null
+                ? service.getObjectRange(owner, key, start, end)
+                : service.getObjectVersionRange(owner, key, versionId, start, end);
+        // Content-Range: bytes start-end/total（闭区间，0 基）
+        return ResponseEntity.status(HttpStatus.PARTIAL_CONTENT)
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .header(HttpHeaders.CONTENT_RANGE,
+                        "bytes " + r.startInclusive() + "-" + r.endInclusive()
+                                + "/" + r.totalSize())
+                .header(HttpHeaders.ACCEPT_RANGES, "bytes")
+                .body(r.data());
     }
 
     @GetMapping("/objects/{key}/versions")
@@ -129,7 +157,12 @@ public class ObjectStoreController {
 
     @GetMapping("/usage")
     public Map<String, Long> usage(@RequestHeader("X-Owner") String owner) {
-        return Map.of("usedBytes", service.usageOf(owner));
+        long incompleteUploadBytes = service.incompleteUploadBytesOf(owner);
+        long usedBytes = service.usageOf(owner);
+        return Map.of(
+                "usedBytes", usedBytes,
+                "incompleteUploadBytes", incompleteUploadBytes,
+                "objectBytes", usedBytes - incompleteUploadBytes);
     }
 
     private VersionResponse toResponse(ObjectVersion v) {
@@ -144,8 +177,9 @@ public class ObjectStoreController {
             case BAD_REQUEST -> HttpStatus.BAD_REQUEST;
             case CHECKSUM_MISMATCH -> HttpStatus.UNPROCESSABLE_ENTITY;
             case QUOTA_EXCEEDED, PART_SIZE_EXCEEDED -> HttpStatus.PAYLOAD_TOO_LARGE;
-            case CONFLICT -> HttpStatus.CONFLICT;
-            case INVALID_STATE -> HttpStatus.CONFLICT;
+            case CONFLICT, MISSING_PARTS, INVALID_STATE -> HttpStatus.CONFLICT;
+            case UPLOAD_EXPIRED -> HttpStatus.GONE;
+            case RANGE_NOT_SATISFIABLE -> HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE;
             case STORAGE_FAILURE -> HttpStatus.INTERNAL_SERVER_ERROR;
         };
         return ResponseEntity.status(status).body(new ErrorResponse(e.code().name(), e.getMessage()));

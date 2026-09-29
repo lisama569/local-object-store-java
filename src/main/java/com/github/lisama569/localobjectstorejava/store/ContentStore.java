@@ -7,6 +7,7 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.Serial;
 import java.io.Serializable;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -30,6 +31,8 @@ public class ContentStore {
 
     /** 每个内容块的引用计数与大小。 */
     record BlobEntry(long refcount, long size) implements Serializable {
+        @Serial
+        private static final long serialVersionUID = 1L;
         BlobEntry retain() { return new BlobEntry(refcount + 1, size); }
         BlobEntry release() { return new BlobEntry(refcount - 1, size); }
     }

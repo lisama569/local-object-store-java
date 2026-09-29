@@ -15,4 +15,6 @@ public record ObjectVersion(
         long createdAtMillis,
         /** 逻辑删除标记：删除操作生成删除标记版本而非物理移除 */
         boolean deleteMarker) implements Serializable {
+    @SuppressWarnings("unused")
+    private static final long serialVersionUID = 1L;
 }
