@@ -6,7 +6,7 @@
 ## 运行与验证
 
 ```bash
-mvn test          # 运行全部 32 个测试（单测日志打印关键输入与判定依据）
+mvn test          # 运行全部 51 个测试（单测日志打印关键输入与判定依据）
 mvn spring-boot:run # 启动 REST 服务（默认 8080 端口）
 ```
 
@@ -14,17 +14,23 @@ REST 接口统一以 `X-Owner` 请求头标识调用方，主要端点：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/uploads` | 创建分片上传会话 |
-| GET | `/api/uploads/{uploadId}` | 查询会话与已提交分片（续传入口） |
+| POST | `/api/uploads` | 创建分片上传会话，body 可选 `{"key","expectedParts"}` 声明总分片数 |
+| GET | `/api/uploads/{uploadId}` | 查询会话与已提交分片（续传入口，会顺延过期） |
 | PUT | `/api/uploads/{uploadId}/parts/{n}` | 提交分片，可带 `X-Expected-Sha256` |
 | POST | `/api/uploads/{uploadId}/complete` | 完成上传，可带整体 `X-Expected-Sha256` |
 | POST | `/api/uploads/{uploadId}/abort` | 中止并回收分片 |
 | PUT | `/api/objects/{key}` | 整体写入 |
-| GET | `/api/objects/{key}[?versionId=]` | 读取当前/指定版本 |
+| GET | `/api/objects/{key}[?versionId=]` | 读取当前/指定版本（全量） |
+| GET | `/api/objects/{key}?start=&end=&versionId=` | 区间读取（闭区间，`end` 省略表示到末尾），命中返回 206 |
+| GET | `/api/objects/{key}` + 头 `Range: bytes=start-end` | 同上的标准 Range 形式 |
 | GET | `/api/objects/{key}/versions` | 版本历史 |
 | GET | `/api/objects` | 列举调用方可见的键 |
 | DELETE | `/api/objects/{key}[?versionId=]` | 删除当前版本（标记）或指定版本（物理） |
-| GET | `/api/usage` | 查询调用方配额用量 |
+| GET | `/api/usage` | 查询调用方配额总用量（存活版本 + 未完成上传分片） |
+| GET | `/api/usage/unfinished-uploads` | 查询调用方当前未完成上传占用的分片字节 |
+
+> 二进制写入（PUT 对象/分片）请带 `Content-Type: application/octet-stream`；
+> 漏发请求体返回 400 `BAD_REQUEST`，不会被当成 500。
 
 ## 存储布局
 
@@ -70,13 +76,69 @@ REST 接口统一以 `X-Owner` 请求头标识调用方，主要端点：
   完成时可带整体校验和，不一致同样拒绝且**不留下可读对象**，会话保持
   `ACTIVE` 供修正重试。
 
+### 可选的分片总数声明（expectedParts）
+
+创建会话时可在 body 中声明本次总分片数：`{"key":"doc","expectedParts":3}`。
+
+- 声明是**可选**的：不传或省略 `expectedParts` 时完全沿用老流程
+  （任意非空分片集合即可完成，分片号允许不连续），老客户端无需任何改造。
+- 声明后，完成时必须 `1..expectedParts` 每一个序号都到齐，否则以
+  `MISSING_PARTS`（HTTP 409）拒绝，响应 `details` 为**缺失分片号的有序列表**，
+  例如 `{"code":"MISSING_PARTS","message":"...","details":[2,5]}`。
+  该原因与「内容对不上（`CHECKSUM_MISMATCH`）」「会话状态不对（`INVALID_STATE`）」
+  通过不同错误码明确区分；被缺片拒绝的会话仍是 `ACTIVE`，补齐后可直接重试完成。
+- 提交序号大于 `expectedParts` 的分片在写入前以 `BAD_REQUEST` 拒绝、不占容量。
+- `expectedParts` 取值范围 `1..objectstore.max-parts`，创建时非法即 `BAD_REQUEST`。
+- 该声明随会话持久化，重启后续传与缺片判定保持一致。
+- 未声明分片数的**历史会话**反序列化后 `expectedParts=null`，行为不变。
+
+## 未完成上传的空闲过期与容量回收
+
+- 配置 `objectstore.upload-idle-ttl-millis`（默认 86400000=24h，`<=0` 关闭过期）：
+  会话自**最近一次交互**（创建/查询/续传/上报分片）起，连续空闲**严格超过**
+  该阈值才判定过期；空闲时长恰好等于阈值不算过期。
+- 交互（含查询与幂等重发相同分片）会滑动续期并刷新 `lastInteractAtMillis`，
+  因此正在续传/上报的会话不会被误回收。
+- 过期是**惰性清扫**：任何会话操作、用量统计、配额判断进入元数据锁后都会先清扫。
+  过期时一次性：释放该会话全部分片的内容引用（引用归零则物理删除块）、
+  清空分片表、状态置为 `EXPIRED` 并原子落盘。回收在同一把元数据锁内完成，
+  与续传/上报分片互斥：并发请求要么在过期判定前成功并把会话续上，
+  要么明确得到 `UPLOAD_EXPIRED`（HTTP 410），不存在容量重复计算、漏算或无法回收。
+- 过期后会话**不能**再查询（410）、续传（410）或完成（410），占用容量归零，
+  且过期状态与已释放容量在重启后保持，不会复活或被重新计入。
+- 中止（`abort`）与完成（`complete`）的会话不受空闲清扫影响。
+- `GET /api/usage/unfinished-uploads` 返回调用方当前未完成（`ACTIVE`）上传占用的
+  分片字节；该数字与 `/api/usage` 中「未完成上传分片」口径、以及配额判断完全一致
+  （统计前都会先清扫过期会话）。
+
+## 区间读取（Byte Range）
+
+当前版本与指定版本均支持按字节区间读取。
+
+- 两种等价形式：
+  - 查询参数：`GET /api/objects/{key}?start=10&end=19[&versionId=...]`，
+    `end` 省略表示一直读到对象末尾。
+  - 标准请求头：`Range: bytes=10-19`（`bytes=10-` 表示到末尾）。
+- 区间为**双闭区间** `[start,end]`，字节下标从 0 开始。命中返回
+  **206 Partial Content**，并带 `Content-Range: bytes start-end/total`
+  与 `Accept-Ranges: bytes`；返回片段与把整段读出后切片的结果一致。
+- 区间读取先整段读出并重新校验整体 SHA-256，**再切片**，因此不会绕过内容校验；
+  跨分片拼接的对象同样适用（可落在分片边界两侧）。
+- 非法区间（`start<0`、`end<-1`、`end>=0 且 end<start`、Range 头语法错误）
+  返回 400 `BAD_REQUEST`；合法但越界（`start>=size` 或 `end>=size`）
+  返回 416 `RANGE_NOT_SATISFIABLE`，并在 `details` 中回带对象总长度。
+- 权限与版本判定与全量读取完全一致：越权一律 404（不暴露对象是否存在），
+  删除标记版本/不存在版本按 404 处理。
+
 ## 配额策略
 
 - `objectstore.quota-bytes`：每个调用方的逻辑字节配额，统计口径为
   「存活版本字节 + 进行中上传的分片字节」。完成上传时引用转移，口径不变；
   中止或物理删除立即释放。
 - `objectstore.max-part-size`：单分片字节上限，超限返回 `PART_SIZE_EXCEEDED`。
-- `objectstore.max-parts`：分片序号上限。
+- `objectstore.max-parts`：分片序号上限（也是 `expectedParts` 上限）。
+- `objectstore.upload-ttl-millis`：滑动有效期，任何交互按此时长顺延 `expiresAt`。
+- `objectstore.upload-idle-ttl-millis`：连续空闲过期阈值，超过即回收（见上文）。
 - 超限在写入前检查，失败后无残留分片、不占用未释放容量。
 
 ## 访问控制
@@ -93,19 +155,32 @@ REST 接口统一以 `X-Owner` 请求头标识调用方，主要端点：
 | Code | HTTP | 含义 |
 |---|---|---|
 | `NOT_FOUND` | 404 | 不存在或越权（含删除标记版本） |
-| `BAD_REQUEST` | 400 | 参数非法 |
+| `BAD_REQUEST` | 400 | 参数非法（含区间语法非法、声明数越界、缺请求体） |
 | `CHECKSUM_MISMATCH` | 422 | 分片/整体校验和不一致 |
 | `QUOTA_EXCEEDED` / `PART_SIZE_EXCEEDED` | 413 | 配额/分片大小超限 |
 | `CONFLICT` | 409 | 同序号分片内容冲突 |
+| `MISSING_PARTS` | 409 | 声明了分片总数但完成时有缺口，`details` 为缺失分片号列表 |
 | `INVALID_STATE` | 409 | 会话已中止/已完成等非法状态 |
+| `UPLOAD_EXPIRED` | 410 | 会话连续空闲过期，容量已回收，不可续传/完成 |
+| `RANGE_NOT_SATISFIABLE` | 416 | 区间合法但越界，`details` 回带对象总长度 |
 | `STORAGE_FAILURE` | 500 | 底层存储失败（含内容损坏、丢失） |
 
 ## 测试覆盖
 
-`src/test/java/.../tests/` 下 32 个测试，日志打印关键输入与判定依据：
+`src/test/java/.../tests/` 下 51 个测试，日志打印关键输入与判定依据：
 
 - `MultipartUploadTest`：乱序分片、重复分片（幂等/冲突）、跨会话续传、
   分片与整体校验失败、完成幂等、中止释放配额。
+- `DeclaredPartsTest`：声明分片数后单缺口/多缺口完成被 `MISSING_PARTS` 拒绝且
+  `details` 精确给出缺口；补齐后完成；超过声明序号/非法声明数 `BAD_REQUEST`；
+  未声明的老流程（允许非连续序号）保持原行为；乱序拼接仍按序号对齐。
+- `UploadExpiryTest`：连续空闲过期回收容量并阻断查询/续传/完成（`UPLOAD_EXPIRED`）、
+  交互滑动续期不过期、边界（空闲恰好等于阈值不过期、再超 1ms 过期）、
+  已完成/已中止会话不被清扫、**8 线程并发上报分片与过期的竞争**（每个请求要么成功
+  续上要么明确过期，容量恰好回收一次、物理块引用归零）。
+- `RangeReadTest`：当前/指定版本的合法区间与整读对齐、`end=-1` 到末尾、
+  非法区间 400 与越界 416 原因可区分（越界带总长度）、删除标记/不存在 404、
+  越权区间与全量一致返回 404、跨分片边界区间一致。
 - `DedupTest`：相同内容多键写入只存一份、独立删除、引用归零回收、
   分片与整体写入之间去重。
 - `VersioningConcurrencyTest`：并发覆盖全部成为完整版本、并发完成收敛到
@@ -113,6 +188,47 @@ REST 接口统一以 `X-Owner` 请求头标识调用方，主要端点：
 - `QuotaTest`：配额/分片大小超限的拒绝原因与无残留、配额按调用方隔离、
   删除后配额释放。
 - `AccessControlTest`：越权读/删/列与「不存在」不可区分、元数据与下载判定一致。
-- `RestartRecoveryTest`：重启后已提交对象、未完成上传、引用计数与配额用量一致。
+- `RestartRecoveryTest`：重启后已提交对象、未完成上传、引用计数与配额用量一致；
+  过期状态与容量回收重启后保持、不复活。
 - `ConcurrentMixedOpsTest`：并发写删同一键收敛（版本数 = 成功写数 + 成功删数）、
   并发上传不同键互不干扰。
+
+## 本地验证新增能力（端到端）
+
+以短空闲阈值启动，便于观察过期：
+
+```bash
+mvn -DskipTests package
+java -jar target/local-object-store-java-1.0-SNAPSHOT.jar \
+  --objectstore.root-dir=/tmp/los-demo \
+  --objectstore.quota-bytes=10000 \
+  --objectstore.upload-idle-ttl-millis=3000 --objectstore.upload-ttl-millis=3000
+```
+
+声明分片数与缺片（二进制写入请带 octet-stream 头）：
+
+```bash
+H='-H Content-Type:application/octet-stream'
+U=$(curl -s -X POST localhost:8080/api/uploads -H 'X-Owner: alice' \
+  -H 'Content-Type: application/json' -d '{"key":"doc","expectedParts":3}' \
+  | sed -E 's/.*"uploadId":"([^"]+)".*/\1/')
+printf AAAA > a; printf CCCC > c; printf BBBB > b
+curl -s -X PUT localhost:8080/api/uploads/$U/parts/1 -H 'X-Owner: alice' $H --data-binary @a
+curl -s -X PUT localhost:8080/api/uploads/$U/parts/3 -H 'X-Owner: alice' $H --data-binary @c
+curl -s -X POST localhost:8080/api/uploads/$U/complete -H 'X-Owner: alice'
+# -> {"code":"MISSING_PARTS",...,"details":[2]}
+curl -s -X PUT localhost:8080/api/uploads/$U/parts/2 -H 'X-Owner: alice' $H --data-binary @b
+curl -s -X POST localhost:8080/api/uploads/$U/complete -H 'X-Owner: alice'
+curl -s localhost:8080/api/objects/doc -H 'X-Owner: alice'   # AAAABBBBCCCC
+```
+
+区间读取（206 + Content-Range）：
+
+```bash
+curl -i 'localhost:8080/api/objects/doc?start=4&end=7' -H 'X-Owner: alice'
+curl -i localhost:8080/api/objects/doc -H 'X-Owner: alice' -H 'Range: bytes=8-11'
+```
+
+过期与占用：建会话传一个分片后静置 >3 秒，再观察
+`GET /api/usage/unfinished-uploads`（归零）与后续操作返回 410 `UPLOAD_EXPIRED`；
+期间每秒 `GET /api/uploads/{id}` 则会话持续 ACTIVE（滑动续期）。

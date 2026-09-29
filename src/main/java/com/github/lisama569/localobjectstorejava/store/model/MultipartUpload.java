@@ -7,7 +7,7 @@ import java.util.TreeMap;
 /** 一次分片上传会话的元数据（可持久化，支持重启恢复与跨会话续传）。 */
 public class MultipartUpload implements Serializable {
 
-    public enum State { ACTIVE, COMPLETED, ABORTED }
+    public enum State { ACTIVE, COMPLETED, ABORTED, EXPIRED }
 
     private final String uploadId;
     private final String owner;
@@ -15,18 +15,30 @@ public class MultipartUpload implements Serializable {
     private final long createdAtMillis;
     /** 滑动过期时间：任何会话交互都会顺延，已上传分片不会因超时丢失 */
     private volatile long expiresAtMillis;
+    /** 最近一次会话交互（创建/查询/提交分片）时间，连续空闲超过阈值才判定过期 */
+    private volatile long lastInteractAtMillis;
+    /** 创建时可选声明的分片总数；null 表示未声明，保持老流程语义 */
+    private final Integer expectedParts;
     private final Map<Integer, PartInfo> parts = new TreeMap<>();
     private volatile State state = State.ACTIVE;
     /** 完成幂等：完成后记录产生的版本号，重复 complete 返回同一结果 */
     private volatile String completedVersionId;
 
+    /** 未声明分片总数的构造（兼容老流程与旧快照反序列化）。 */
     public MultipartUpload(String uploadId, String owner, String key,
                            long createdAtMillis, long expiresAtMillis) {
+        this(uploadId, owner, key, createdAtMillis, expiresAtMillis, null);
+    }
+
+    public MultipartUpload(String uploadId, String owner, String key,
+                           long createdAtMillis, long expiresAtMillis, Integer expectedParts) {
         this.uploadId = uploadId;
         this.owner = owner;
         this.key = key;
         this.createdAtMillis = createdAtMillis;
         this.expiresAtMillis = expiresAtMillis;
+        this.lastInteractAtMillis = createdAtMillis;
+        this.expectedParts = expectedParts;
     }
 
     public String uploadId() { return uploadId; }
@@ -34,7 +46,13 @@ public class MultipartUpload implements Serializable {
     public String key() { return key; }
     public long createdAtMillis() { return createdAtMillis; }
     public long expiresAtMillis() { return expiresAtMillis; }
-    public void touch(long newExpiresAtMillis) { this.expiresAtMillis = newExpiresAtMillis; }
+    /** 显式记录交互时间与新的过期时间（由服务层按当前时钟计算）。 */
+    public void interactedAt(long nowMillis, long newExpiresAtMillis) {
+        this.lastInteractAtMillis = nowMillis;
+        this.expiresAtMillis = newExpiresAtMillis;
+    }
+    public long lastInteractAtMillis() { return lastInteractAtMillis; }
+    public Integer expectedParts() { return expectedParts; }
     public State state() { return state; }
     public void state(State s) { this.state = s; }
     public Map<Integer, PartInfo> parts() { return parts; }

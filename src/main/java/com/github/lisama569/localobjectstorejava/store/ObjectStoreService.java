@@ -6,12 +6,14 @@ import com.github.lisama569.localobjectstorejava.store.model.PartInfo;
 import com.github.lisama569.localobjectstorejava.store.model.StoredObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.function.LongSupplier;
 
 /**
  * 对象存储主流程：分片上传、去重、版本、配额与访问控制。
@@ -26,22 +28,41 @@ public class ObjectStoreService {
     private final StorageConfig config;
     private final ContentStore contentStore;
     private final MetadataStore metadataStore;
+    /** 可替换时钟，测试中用来推进空闲时间；生产环境为系统时钟。 */
+    private final LongSupplier clock;
 
+    @Autowired
     public ObjectStoreService(StorageConfig config, ContentStore contentStore, MetadataStore metadataStore) {
+        this(config, contentStore, metadataStore, System::currentTimeMillis);
+    }
+
+    public ObjectStoreService(StorageConfig config, ContentStore contentStore, MetadataStore metadataStore,
+                              LongSupplier clock) {
         this.config = config;
         this.contentStore = contentStore;
         this.metadataStore = metadataStore;
+        this.clock = clock;
     }
 
-    /** 创建分片上传会话。 */
+    /** 创建分片上传会话（不声明分片总数，老流程）。 */
     public MultipartUpload createUpload(String owner, String key) {
+        return createUpload(owner, key, null);
+    }
+
+    /** 创建分片上传会话；expectedParts 非空时声明总分片数，完成时必须 1..N 到齐。 */
+    public MultipartUpload createUpload(String owner, String key, Integer expectedParts) {
         requireText(owner, "owner");
         requireText(key, "key");
-        long now = System.currentTimeMillis();
+        if (expectedParts != null && (expectedParts < 1 || expectedParts > config.getMaxParts())) {
+            throw new StoreException(StoreException.Code.BAD_REQUEST,
+                    "声明的分片总数越界: " + expectedParts + " (允许 1.." + config.getMaxParts() + ")");
+        }
+        long now = clock.getAsLong();
         MultipartUpload upload = new MultipartUpload(
-                UUID.randomUUID().toString(), owner, key, now, now + config.getUploadTtlMillis());
+                UUID.randomUUID().toString(), owner, key, now, now + config.getUploadTtlMillis(), expectedParts);
         metadataStore.saveUpload(upload);
-        log.info("createUpload owner={} key={} uploadId={}", owner, key, upload.uploadId());
+        log.info("createUpload owner={} key={} uploadId={} expectedParts={}",
+                owner, key, upload.uploadId(), expectedParts);
         return upload;
     }
 
@@ -49,9 +70,29 @@ public class ObjectStoreService {
     public MultipartUpload getUpload(String owner, String uploadId) {
         return metadataStore.inLock(() -> {
             MultipartUpload upload = requireUpload(owner, uploadId);
-            touch(upload);
-            metadataStore.saveUpload(upload);
+            if (upload.state() == MultipartUpload.State.EXPIRED) {
+                throw expiredException(upload);
+            }
+            if (upload.state() == MultipartUpload.State.ACTIVE) {
+                if (expireIfIdle(upload)) {
+                    throw expiredException(upload);
+                }
+                touch(upload);
+                metadataStore.saveUpload(upload);
+            }
             return upload;
+        });
+    }
+
+    /**
+     * 查看会话状态：做权限判定与过期清扫，但不顺延过期时间（区别于 {@link #getUpload}）。
+     * 供运维/测试观察真实空闲状态使用。
+     */
+    public MultipartUpload.State peekUploadState(String owner, String uploadId) {
+        return metadataStore.inLock(() -> {
+            MultipartUpload upload = requireUpload(owner, uploadId);
+            expireIfIdle(upload);
+            return upload.state();
         });
     }
 
@@ -78,7 +119,12 @@ public class ObjectStoreService {
         }
         return metadataStore.inLock(() -> {
             MultipartUpload upload = requireUpload(owner, uploadId);
-            requireActive(upload);
+            requireUsable(upload);
+            if (upload.expectedParts() != null && partNumber > upload.expectedParts()) {
+                throw new StoreException(StoreException.Code.BAD_REQUEST,
+                        "分片序号超过声明总数: part=" + partNumber
+                                + " expectedParts=" + upload.expectedParts());
+            }
             PartInfo existing = upload.parts().get(partNumber);
             if (existing != null) {
                 if (existing.sha256().equals(actualSha)) {
@@ -112,8 +158,24 @@ public class ObjectStoreService {
                 // 幂等：返回首次完成产生的版本
                 return findVersion(owner, upload.key(), upload.completedVersionId());
             }
-            requireActive(upload);
-            if (upload.parts().isEmpty()) {
+            requireUsable(upload);
+            Integer expectedParts = upload.expectedParts();
+            if (expectedParts != null) {
+                // 声明了分片总数：必须 1..N 全部到齐，缺口明确返回 MISSING_PARTS
+                List<Integer> missing = new ArrayList<>();
+                for (int n = 1; n <= expectedParts; n++) {
+                    if (!upload.parts().containsKey(n)) {
+                        missing.add(n);
+                    }
+                }
+                if (!missing.isEmpty()) {
+                    log.info("completeUpload missing parts uploadId={} expected={} have={} missing={}",
+                            uploadId, expectedParts, upload.parts().keySet(), missing);
+                    throw new StoreException(StoreException.Code.MISSING_PARTS,
+                            "分片未到齐: expectedParts=" + expectedParts + " missing=" + missing,
+                            missing);
+                }
+            } else if (upload.parts().isEmpty()) {
                 throw new StoreException(StoreException.Code.INVALID_STATE,
                         "上传会话没有任何分片，无法完成: " + uploadId);
             }
@@ -211,6 +273,52 @@ public class ObjectStoreService {
         return readVersion(version);
     }
 
+    /** 按字节区间读取当前版本：[start,end] 双闭区间，end 可传 -1 表示到对象末尾。 */
+    public RangeRead getObjectRange(String owner, String key, long start, long end) {
+        StoredObject object = requireObject(owner, key);
+        ObjectVersion current = object.current();
+        if (current == null || current.deleteMarker()) {
+            throw new StoreException(StoreException.Code.NOT_FOUND, "对象不存在: " + key);
+        }
+        return readRange(current, start, end);
+    }
+
+    /** 按字节区间读取指定版本。 */
+    public RangeRead getObjectVersionRange(String owner, String key, String versionId, long start, long end) {
+        ObjectVersion version = findVersion(owner, key, versionId);
+        if (version.deleteMarker()) {
+            throw new StoreException(StoreException.Code.NOT_FOUND,
+                    "版本是删除标记，无内容: " + versionId);
+        }
+        return readRange(version, start, end);
+    }
+
+    /** 一次区间读取的结果：切片内容 + 对象总长度 + 实际生效的闭区间边界。 */
+    public record RangeRead(byte[] data, long totalSize, long start, long end) {}
+
+    private RangeRead readRange(ObjectVersion version, long start, long endInclusive) {
+        // 先整段读出并校验哈希，再切片：区间读取不能绕过内容校验
+        byte[] full = readVersion(version);
+        long total = full.length;
+        if (start < 0 || endInclusive < -1 || (endInclusive >= 0 && endInclusive < start)) {
+            throw new StoreException(StoreException.Code.BAD_REQUEST,
+                    "区间非法: start=" + start + " end=" + endInclusive
+                            + "（要求 start>=0、end=-1 或 end>=start）");
+        }
+        long end = endInclusive == -1 ? total - 1 : endInclusive;
+        if (start >= total || end >= total) {
+            throw new StoreException(StoreException.Code.RANGE_NOT_SATISFIABLE,
+                    "区间越界: start=" + start + " end=" + end + " objectSize=" + total,
+                    total);
+        }
+        int len = (int) (end - start + 1);
+        byte[] slice = new byte[len];
+        System.arraycopy(full, (int) start, slice, 0, len);
+        log.info("readRange versionId={} total={} range=[{},{}] sliceBytes={}",
+                version.versionId(), total, start, end, len);
+        return new RangeRead(slice, total, start, end);
+    }
+
     /** 列出版本历史（元数据查询，权限判定与下载一致）。 */
     public List<ObjectVersion> listVersions(String owner, String key) {
         return List.copyOf(requireObject(owner, key).versions());
@@ -264,22 +372,77 @@ public class ObjectStoreService {
         });
     }
 
-    /** 当前调用方逻辑用量：存活版本字节 + 进行中上传的分片字节。 */
+    /** 当前调用方逻辑用量：存活版本字节 + 进行中上传的分片字节（先清扫过期会话，口径与配额一致）。 */
     public long usageOf(String owner) {
-        long used = 0;
-        for (StoredObject o : metadataStore.listObjects(owner)) {
-            for (ObjectVersion v : o.versions()) {
-                if (!v.deleteMarker()) {
-                    used += v.size();
+        return metadataStore.inLock(() -> {
+            sweepExpired(owner);
+            long used = 0;
+            for (StoredObject o : metadataStore.listObjects(owner)) {
+                for (ObjectVersion v : o.versions()) {
+                    if (!v.deleteMarker()) {
+                        used += v.size();
+                    }
                 }
             }
-        }
-        return used + activeUploadBytes(owner);
+            return used + activeUploadBytes(owner);
+        });
+    }
+
+    /** 当前调用方未完成（ACTIVE）上传占用的分片字节；过期会话容量已回收，不计入。 */
+    public long unfinishedUploadBytes(String owner) {
+        return metadataStore.inLock(() -> {
+            sweepExpired(owner);
+            return activeUploadBytes(owner);
+        });
     }
 
     // ---- 内部辅助 ----
 
-    /** 仅统计 ACTIVE 会话：已完成会话的分片引用已转移给版本，已中止会话已回收。 */
+    /**
+     * 清扫调用方所有连续空闲超时的 ACTIVE 会话：回收分片引用并置为 EXPIRED。
+     * 必须在元数据锁内调用，与续传/上报分片互斥，容量释放恰好一次。
+     */
+    private void sweepExpired(String owner) {
+        for (MultipartUpload u : metadataStore.uploadsOf(owner)) {
+            if (u.state() == MultipartUpload.State.ACTIVE) {
+                expireIfIdle(u);
+            }
+        }
+    }
+
+    /**
+     * 判定单个会话是否已连续空闲超时；若是则回收容量并标记 EXPIRED（幂等：只回收一次）。
+     * 必须在元数据锁内调用。返回 true 表示本次调用完成了过期回收。
+     */
+    private boolean expireIfIdle(MultipartUpload upload) {
+        long idleTtl = config.getUploadIdleTtlMillis();
+        if (idleTtl <= 0 || upload.state() != MultipartUpload.State.ACTIVE) {
+            return false;
+        }
+        long now = clock.getAsLong();
+        if (now - upload.lastInteractAtMillis() <= idleTtl) {
+            return false;
+        }
+        long released = upload.parts().values().stream().mapToLong(PartInfo::size).sum();
+        for (PartInfo part : upload.parts().values()) {
+            contentStore.release(part.sha256());
+        }
+        upload.parts().clear();
+        upload.state(MultipartUpload.State.EXPIRED);
+        metadataStore.saveUpload(upload);
+        log.info("uploadExpired uploadId={} owner={} key={} idleMs={} releasedBytes={}",
+                upload.uploadId(), upload.owner(), upload.key(),
+                now - upload.lastInteractAtMillis(), released);
+        return true;
+    }
+
+    private static StoreException expiredException(MultipartUpload upload) {
+        return new StoreException(StoreException.Code.UPLOAD_EXPIRED,
+                "上传会话已过期且容量已回收，不能续传或完成: " + upload.uploadId()
+                        + " expiredAt=" + upload.expiresAtMillis());
+    }
+
+    /** 仅统计 ACTIVE 会话：已完成会话的分片引用已转移给版本，已中止/已过期会话已回收。 */
     private long activeUploadBytes(String owner) {
         long sum = 0;
         for (MultipartUpload u : metadataStore.uploadsOf(owner)) {
@@ -368,9 +531,26 @@ public class ObjectStoreService {
         }
     }
 
-    /** 滑动续期：任何会话交互都顺延过期时间，已上传分片不因超时丢失。 */
+    /**
+     * 续传/完成前的统一可用性判定，必须在元数据锁内调用：
+     * 已过期（含被并发请求刚标记过期）→ UPLOAD_EXPIRED；
+     * 连续空闲恰好超过阈值 → 当场回收并 UPLOAD_EXPIRED；
+     * 其他非活动状态 → INVALID_STATE。
+     */
+    private void requireUsable(MultipartUpload upload) {
+        if (upload.state() == MultipartUpload.State.EXPIRED) {
+            throw expiredException(upload);
+        }
+        requireActive(upload);
+        if (expireIfIdle(upload)) {
+            throw expiredException(upload);
+        }
+    }
+
+    /** 滑动续期：任何会话交互都按当前时钟顺延过期时间，已上传分片不因连续活跃而超时。 */
     private void touch(MultipartUpload upload) {
-        upload.touch(System.currentTimeMillis() + config.getUploadTtlMillis());
+        long now = clock.getAsLong();
+        upload.interactedAt(now, now + config.getUploadTtlMillis());
     }
 
     private static void requireText(String value, String name) {

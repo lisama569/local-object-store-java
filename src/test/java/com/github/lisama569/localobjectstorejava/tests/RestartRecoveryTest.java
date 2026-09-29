@@ -1,6 +1,7 @@
 package com.github.lisama569.localobjectstorejava.tests;
 
 import com.github.lisama569.localobjectstorejava.store.ObjectStoreService;
+import com.github.lisama569.localobjectstorejava.store.StoreException;
 import com.github.lisama569.localobjectstorejava.store.model.MultipartUpload;
 import com.github.lisama569.localobjectstorejava.store.model.ObjectVersion;
 import org.junit.jupiter.api.Test;
@@ -12,6 +13,7 @@ import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /** 重启场景：未完成上传与已提交对象的元数据在进程重启后不得错乱。 */
 class RestartRecoveryTest {
@@ -89,5 +91,27 @@ class RestartRecoveryTest {
         ObjectStoreService svc2 = TestSupport.newService(dir);
         assertEquals(before, svc2.usageOf(OWNER),
                 "重启后配额用量统计必须一致（含进行中上传的分片）");
+    }
+
+    @Test
+    void expiredUploadStaysExpiredAndReleasedAfterRestart() {
+        TestSupport.FakeClock clock = new TestSupport.FakeClock();
+        ObjectStoreService svc1 = TestSupport.newService(dir, 1024, 1024, 1000, clock.supplier());
+        MultipartUpload up = svc1.createUpload(OWNER, "expiring");
+        svc1.uploadPart(OWNER, up.uploadId(), 1, TestSupport.bytes("gone-", 40), null);
+        clock.advance(2000);
+        assertEquals(0, svc1.usageOf(OWNER), "过期后容量必须已回收");
+        assertEquals(MultipartUpload.State.EXPIRED, svc1.peekUploadState(OWNER, up.uploadId()));
+        log.info("input: upload expired before restart, uploadId={}", up.uploadId());
+
+        // 重启后（系统时钟远在基准时钟之后，空闲必然超时）状态与容量仍须保持
+        ObjectStoreService svc2 = TestSupport.newService(dir);
+        assertEquals(MultipartUpload.State.EXPIRED, svc2.peekUploadState(OWNER, up.uploadId()),
+                "EXPIRED 状态必须持久化，重启后不得复活");
+        assertEquals(0, svc2.usageOf(OWNER), "重启后已释放容量不得被重新计入");
+        StoreException e = assertThrows(StoreException.class, () ->
+                svc2.uploadPart(OWNER, up.uploadId(), 2, TestSupport.bytes("x-", 5), null));
+        assertEquals(StoreException.Code.UPLOAD_EXPIRED, e.code(), "重启后续传过期会话仍须被拒绝");
+        log.info("decision: expiry persisted across restart code={}", e.code());
     }
 }

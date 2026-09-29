@@ -20,8 +20,11 @@ public class StorageConfig {
     /** 最大分片数量 */
     private int maxParts = 10_000;
 
-    /** 未完成上传会话的过期毫秒数 */
+    /** 未完成上传会话的过期毫秒数（滑动窗口，任何交互顺延） */
     private long uploadTtlMillis = 24L * 3600 * 1000;
+
+    /** 连续空闲超过该毫秒数后，未完成上传会话被判定过期并回收容量；<=0 表示不过期 */
+    private long uploadIdleTtlMillis = 24L * 3600 * 1000;
 
     public String getRootDir() { return rootDir; }
     public void setRootDir(String rootDir) { this.rootDir = rootDir; }
@@ -33,4 +36,6 @@ public class StorageConfig {
     public void setMaxParts(int maxParts) { this.maxParts = maxParts; }
     public long getUploadTtlMillis() { return uploadTtlMillis; }
     public void setUploadTtlMillis(long uploadTtlMillis) { this.uploadTtlMillis = uploadTtlMillis; }
+    public long getUploadIdleTtlMillis() { return uploadIdleTtlMillis; }
+    public void setUploadIdleTtlMillis(long uploadIdleTtlMillis) { this.uploadIdleTtlMillis = uploadIdleTtlMillis; }
 }

@@ -21,6 +21,12 @@ public class StoreException extends RuntimeException {
         CONFLICT,
         /** 状态非法（如上传已完成/已中止/已过期） */
         INVALID_STATE,
+        /** 声明了分片总数，但完成时仍有缺口（与校验失败、状态非法相区分） */
+        MISSING_PARTS,
+        /** 上传会话因连续空闲超过阈值已过期，容量已被回收 */
+        UPLOAD_EXPIRED,
+        /** 区间读取的范围越界（start/end 超出对象长度） */
+        RANGE_NOT_SATISFIABLE,
         /** 底层存储失败 */
         STORAGE_FAILURE,
         /** 请求参数非法 */
@@ -28,18 +34,30 @@ public class StoreException extends RuntimeException {
     }
 
     private final Code code;
+    /** 结构化补充信息（如 MISSING_PARTS 时的缺失分片号列表），可为空 */
+    private final transient Object details;
 
     public StoreException(Code code, String message) {
+        this(code, message, null);
+    }
+
+    public StoreException(Code code, String message, Object details) {
         super(message);
         this.code = code;
+        this.details = details;
     }
 
     public StoreException(Code code, String message, Throwable cause) {
         super(message, cause);
         this.code = code;
+        this.details = null;
     }
 
     public Code code() {
         return code;
+    }
+
+    public Object details() {
+        return details;
     }
 }
