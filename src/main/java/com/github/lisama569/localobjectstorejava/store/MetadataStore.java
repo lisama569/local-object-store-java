@@ -101,6 +101,11 @@ public class MetadataStore {
         return result;
     }
 
+    /** 列出全部上传会话（不分调用方，供后台过期清扫使用）；返回快照副本。 */
+    public List<MultipartUpload> allUploads() {
+        return new ArrayList<>(uploads.values());
+    }
+
     public void saveUpload(MultipartUpload upload) {
         lock.lock();
         try {

@@ -26,6 +26,9 @@ public class StorageConfig {
     /** 连续空闲超过该毫秒数后，未完成上传会话被判定过期并回收容量；<=0 表示不过期 */
     private long uploadIdleTtlMillis = 24L * 3600 * 1000;
 
+    /** 后台过期清扫周期（毫秒）；<=0 表示不启用后台清扫，仅靠请求惰性触发 */
+    private long uploadIdleSweepMillis = 5000;
+
     public String getRootDir() { return rootDir; }
     public void setRootDir(String rootDir) { this.rootDir = rootDir; }
     public long getQuotaBytes() { return quotaBytes; }
@@ -38,4 +41,6 @@ public class StorageConfig {
     public void setUploadTtlMillis(long uploadTtlMillis) { this.uploadTtlMillis = uploadTtlMillis; }
     public long getUploadIdleTtlMillis() { return uploadIdleTtlMillis; }
     public void setUploadIdleTtlMillis(long uploadIdleTtlMillis) { this.uploadIdleTtlMillis = uploadIdleTtlMillis; }
+    public long getUploadIdleSweepMillis() { return uploadIdleSweepMillis; }
+    public void setUploadIdleSweepMillis(long uploadIdleSweepMillis) { this.uploadIdleSweepMillis = uploadIdleSweepMillis; }
 }
