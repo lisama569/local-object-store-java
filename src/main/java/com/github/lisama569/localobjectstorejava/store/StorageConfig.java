@@ -8,6 +8,9 @@ import org.springframework.stereotype.Component;
 @ConfigurationProperties(prefix = "objectstore")
 public class StorageConfig {
 
+    /** 后台空闲过期回收的默认调度间隔（毫秒）。 */
+    public static final long DEFAULT_SWEEP_INTERVAL_MILLIS = 1000L;
+
     /** 数据与元数据落盘根目录 */
     private String rootDir = "data/object-store";
 
@@ -26,6 +29,9 @@ public class StorageConfig {
     /** 连续空闲超过该毫秒数后，未完成上传会话被判定过期并回收容量；<=0 表示不过期 */
     private long uploadIdleTtlMillis = 24L * 3600 * 1000;
 
+    /** 后台回收器扫描间隔（毫秒）：无后续请求时最迟在“空闲阈值 + 该间隔”内释放容量 */
+    private long uploadSweepIntervalMillis = DEFAULT_SWEEP_INTERVAL_MILLIS;
+
     public String getRootDir() { return rootDir; }
     public void setRootDir(String rootDir) { this.rootDir = rootDir; }
     public long getQuotaBytes() { return quotaBytes; }
@@ -38,4 +44,6 @@ public class StorageConfig {
     public void setUploadTtlMillis(long uploadTtlMillis) { this.uploadTtlMillis = uploadTtlMillis; }
     public long getUploadIdleTtlMillis() { return uploadIdleTtlMillis; }
     public void setUploadIdleTtlMillis(long uploadIdleTtlMillis) { this.uploadIdleTtlMillis = uploadIdleTtlMillis; }
+    public long getUploadSweepIntervalMillis() { return uploadSweepIntervalMillis; }
+    public void setUploadSweepIntervalMillis(long uploadSweepIntervalMillis) { this.uploadSweepIntervalMillis = uploadSweepIntervalMillis; }
 }

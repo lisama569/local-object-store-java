@@ -1,5 +1,7 @@
 package com.github.lisama569.localobjectstorejava.store.model;
 
+import java.io.IOException;
+import java.io.ObjectInputStream;
 import java.io.Serializable;
 import java.util.Map;
 import java.util.TreeMap;
@@ -58,4 +60,16 @@ public class MultipartUpload implements Serializable {
     public Map<Integer, PartInfo> parts() { return parts; }
     public String completedVersionId() { return completedVersionId; }
     public void completedVersionId(String id) { this.completedVersionId = id; }
+
+    /**
+     * 兼容旧快照：lastInteractAtMillis 是空闲过期特性引入的字段，旧版本序列化的会话里不存在，
+     * 反序列化后为默认值 0。若不修正，启用空闲过期后这些历史会话会因 now-0 超过阈值被立刻误回收。
+     * 统一回填为创建时间（等价于“创建后尚未发生额外交互”），保持既有会话原样、不要求调用方改造。
+     */
+    private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+        in.defaultReadObject();
+        if (lastInteractAtMillis == 0L) {
+            lastInteractAtMillis = createdAtMillis;
+        }
+    }
 }

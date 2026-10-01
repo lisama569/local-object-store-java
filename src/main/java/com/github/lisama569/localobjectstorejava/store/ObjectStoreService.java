@@ -69,14 +69,12 @@ public class ObjectStoreService {
     /** 查询上传会话（含已提交分片），越权与不存在均返回 NOT_FOUND；查询会顺延过期时间。 */
     public MultipartUpload getUpload(String owner, String uploadId) {
         return metadataStore.inLock(() -> {
+            sweepExpired(owner);
             MultipartUpload upload = requireUpload(owner, uploadId);
             if (upload.state() == MultipartUpload.State.EXPIRED) {
                 throw expiredException(upload);
             }
             if (upload.state() == MultipartUpload.State.ACTIVE) {
-                if (expireIfIdle(upload)) {
-                    throw expiredException(upload);
-                }
                 touch(upload);
                 metadataStore.saveUpload(upload);
             }
@@ -90,9 +88,8 @@ public class ObjectStoreService {
      */
     public MultipartUpload.State peekUploadState(String owner, String uploadId) {
         return metadataStore.inLock(() -> {
-            MultipartUpload upload = requireUpload(owner, uploadId);
-            expireIfIdle(upload);
-            return upload.state();
+            sweepExpired(owner);
+            return requireUpload(owner, uploadId).state();
         });
     }
 
@@ -118,6 +115,9 @@ public class ObjectStoreService {
                     "分片校验和不一致: expected=" + expectedSha256 + " actual=" + actualSha);
         }
         return metadataStore.inLock(() -> {
+            // 进入锁后先做一次（且仅此一次）owner 维度的空闲判定；
+            // 之后本次交互不再对时钟二次采样，杜绝“处理途中被自己清扫掉、却仍返回成功”。
+            sweepExpired(owner);
             MultipartUpload upload = requireUpload(owner, uploadId);
             requireUsable(upload);
             if (upload.expectedParts() != null && partNumber > upload.expectedParts()) {
@@ -153,12 +153,16 @@ public class ObjectStoreService {
     /** 完成上传：按分片序号拼接、整体校验后生成新版本；重复完成返回同一版本。 */
     public ObjectVersion completeUpload(String owner, String uploadId, String expectedContentSha256) {
         return metadataStore.inLock(() -> {
+            sweepExpired(owner);
             MultipartUpload upload = requireUpload(owner, uploadId);
+            if (upload.state() == MultipartUpload.State.EXPIRED) {
+                throw expiredException(upload);
+            }
             if (upload.state() == MultipartUpload.State.COMPLETED) {
                 // 幂等：返回首次完成产生的版本
                 return findVersion(owner, upload.key(), upload.completedVersionId());
             }
-            requireUsable(upload);
+            requireActive(upload);
             Integer expectedParts = upload.expectedParts();
             if (expectedParts != null) {
                 // 声明了分片总数：必须 1..N 全部到齐，缺口明确返回 MISSING_PARTS
@@ -208,6 +212,7 @@ public class ObjectStoreService {
     /** 中止上传并回收分片占用。 */
     public void abortUpload(String owner, String uploadId) {
         metadataStore.inLock(() -> {
+            sweepExpired(owner);
             MultipartUpload upload = requireUpload(owner, uploadId);
             if (upload.state() == MultipartUpload.State.COMPLETED) {
                 throw new StoreException(StoreException.Code.INVALID_STATE,
@@ -238,6 +243,7 @@ public class ObjectStoreService {
                     "内容校验和不一致: expected=" + expectedSha256 + " actual=" + actualSha);
         }
         return metadataStore.inLock(() -> {
+            sweepExpired(owner);
             checkQuota(owner, data.length);
             String sha = contentStore.put(data);
             ObjectVersion version = new ObjectVersion(
@@ -372,19 +378,11 @@ public class ObjectStoreService {
         });
     }
 
-    /** 当前调用方逻辑用量：存活版本字节 + 进行中上传的分片字节（先清扫过期会话，口径与配额一致）。 */
+    /** 当前调用方逻辑用量：存活版本字节 + 进行中上传的分片字节（进入锁后先清扫过期会话，口径与配额一致）。 */
     public long usageOf(String owner) {
         return metadataStore.inLock(() -> {
             sweepExpired(owner);
-            long used = 0;
-            for (StoredObject o : metadataStore.listObjects(owner)) {
-                for (ObjectVersion v : o.versions()) {
-                    if (!v.deleteMarker()) {
-                        used += v.size();
-                    }
-                }
-            }
-            return used + activeUploadBytes(owner);
+            return logicalUsedBytes(owner);
         });
     }
 
@@ -399,8 +397,29 @@ public class ObjectStoreService {
     // ---- 内部辅助 ----
 
     /**
+     * 后台/无后续请求场景下的全量回收：遍历所有调用方，在元数据锁内把连续空闲超时的
+     * ACTIVE 会话统一回收，返回本次实际过期的会话数。幂等，可由定时器反复调用。
+     */
+    public int sweepAllExpired() {
+        return metadataStore.inLock(() -> {
+            int expired = 0;
+            for (MultipartUpload u : metadataStore.allUploads()) {
+                if (expireIfIdle(u)) {
+                    expired++;
+                }
+            }
+            if (expired > 0) {
+                log.info("sweepAllExpired reaped={} uploads", expired);
+            }
+            return expired;
+        });
+    }
+
+    /**
      * 清扫调用方所有连续空闲超时的 ACTIVE 会话：回收分片引用并置为 EXPIRED。
-     * 必须在元数据锁内调用，与续传/上报分片互斥，容量释放恰好一次。
+     * 必须在元数据锁内、且在一次交互的最开始只调用一次：它是本次交互对空闲状态的
+     * 唯一判定点，之后处理流程不再重新读时钟、不再重新清扫，保证“要么整次交互成功
+     * 并续期、要么明确按已过期失败”，不会出现处理途中会话被自己回收的中间态。
      */
     private void sweepExpired(String owner) {
         for (MultipartUpload u : metadataStore.uploadsOf(owner)) {
@@ -453,8 +472,28 @@ public class ObjectStoreService {
         return sum;
     }
 
+    /**
+     * 逻辑用量（存活版本字节 + ACTIVE 上传分片字节），不触发清扫。
+     * 调用方必须已在同一锁段内完成入口清扫，统计结果与真实占用一致。
+     */
+    private long logicalUsedBytes(String owner) {
+        long used = 0;
+        for (StoredObject o : metadataStore.listObjects(owner)) {
+            for (ObjectVersion v : o.versions()) {
+                if (!v.deleteMarker()) {
+                    used += v.size();
+                }
+            }
+        }
+        return used + activeUploadBytes(owner);
+    }
+
+    /**
+     * 配额检查：仅做算术比较，不触发清扫，也不对时钟二次采样。
+     * 调用方（putObject/uploadPart/complete 等）必须在进入锁后先执行一次入口清扫。
+     */
     private void checkQuota(String owner, long additionalBytes) {
-        long used = usageOf(owner);
+        long used = logicalUsedBytes(owner);
         if (used + additionalBytes > config.getQuotaBytes()) {
             log.info("quota exceeded owner={} used={} additional={} quota={}",
                     owner, used, additionalBytes, config.getQuotaBytes());
@@ -532,19 +571,16 @@ public class ObjectStoreService {
     }
 
     /**
-     * 续传/完成前的统一可用性判定，必须在元数据锁内调用：
-     * 已过期（含被并发请求刚标记过期）→ UPLOAD_EXPIRED；
-     * 连续空闲恰好超过阈值 → 当场回收并 UPLOAD_EXPIRED；
-     * 其他非活动状态 → INVALID_STATE。
+     * 续传/完成前的统一状态判定，必须在元数据锁内、入口清扫之后调用：
+     * 已过期（含被本次入口清扫或并发请求刚标记过期）→ UPLOAD_EXPIRED；
+     * 已中止/已完成等其他非活动状态 → INVALID_STATE。
+     * 这里只看状态、不再读时钟：空闲是否超时完全由入口处那次唯一判定决定。
      */
     private void requireUsable(MultipartUpload upload) {
         if (upload.state() == MultipartUpload.State.EXPIRED) {
             throw expiredException(upload);
         }
         requireActive(upload);
-        if (expireIfIdle(upload)) {
-            throw expiredException(upload);
-        }
     }
 
     /** 滑动续期：任何会话交互都按当前时钟顺延过期时间，已上传分片不因连续活跃而超时。 */
